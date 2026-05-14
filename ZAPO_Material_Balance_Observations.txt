@@ -1,0 +1,122 @@
+
+
+1. Why “Display Material Balance” shows No Data Found (variant TEST-MATBAL)
+The message No Data Found comes from three different checks; any of them can fire for a “test” setup.
+
+A. Nothing in the custom tables for that session + division
+
+Display loads persisted data only:
+
+    SELECT *
+      FROM zapo_matbal_hrd
+      INTO TABLE gt_matbal_hrd
+      WHERE sessionname EQ p_orun AND div IN s_div.
+    IF sy-subrc = 0.
+      SELECT *
+        FROM zapo_matbal_item
+        INTO TABLE gt_matbal_item
+        WHERE sessionname = p_orun AND div IN s_div.
+      IF sy-subrc <> 0.
+        MESSAGE 'No Data Found'(037) TYPE 'S' DISPLAY LIKE 'E'.
+        LEAVE LIST-PROCESSING.
+      ENDIF.
+    ELSE.
+      MESSAGE 'No Data Found'(037) TYPE 'S' DISPLAY LIKE 'E'.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+So you get No Data Found if:
+
+p_orun in the variant does not exactly match sessionname stored in ZAPO_MATBAL_HRD / ZAPO_MATBAL_ITEM (including spaces/case if relevant), or
+there is a header but no item rows for that session and div IN s_div, or
+s_div in the variant excludes the division rows were saved with.
+B. In-memory ALV table is still empty after process_material_balance
+
+Even if the DB read succeeds, display aborts if the final dynamic table has no lines:
+
+    ASSIGN lo_outtab->* TO <lfs_final>.
+    IF sy-subrc = 0 AND <lfs_final> IS ASSIGNED.
+      IF <lfs_final> IS INITIAL.
+        MESSAGE 'No Data Found'(037) TYPE 'S' DISPLAY LIKE 'E'.
+        LEAVE LIST-PROCESSING.
+That usually means the transpose step did not build any lo_outtab rows (e.g. inconsistent header/item data or an edge case in process_material_balance).
+
+C. “TEST” generate path often produces nothing to save
+
+For optimizer names containing TEST, generation does not read the live SNP log; it goes through mock upload, and the CSV upload block is commented out:
+
+    IF p_orun CS 'TEST'.
+*      load mock data from CSV file in given location
+      me->upd_mock_data_gen_matbal( ).
+    ELSE.
+*      fetch all log required data
+      me->fetch_log_data( ).
+    ENDIF.
+Planning book data is also skipped for TEST:
+
+    me->calculate_inp_dmd( ).
+    IF NOT p_orun CS 'TEST'.
+      me->fetch_pb_data( ).
+    ENDIF.
+So if you only run Display for TEST-MATBAL without a prior successful Generate + Save for that same p_orun, or Generate runs with empty internal tables, Z tables stay empty → Display shows No Data Found, while a run like P1005781:001:... (non-TEST) can show data because it was generated from the real log and saved.
+
+What to do functionally: In AD1, check ZAPO_MATBAL_HRD / ZAPO_MATBAL_ITEM for the exact sessionname and divisions your variant uses; align s_div and p_orun with saved data; for test logs either enable mock CSV again or generate using a real session name (not *TEST*) and then display that session.
+
+2. When can “Supply Location” look like Ship-to Party?
+In this program SUPPLY_PLANT is always an APO location number (/sapapo/locno), passed through as iv_supply_plant from TLane / demand logic (see append_to_outtab_dyn and SALV text “Supply Location”). It is not populated from KUNNR as a separate semantic field.
+
+It can look like a ship-to because:
+
+In APO/SNP, customers are locations too (loctype for customer, e.g. 1010 in your fetch_loc_detail_customer). If the customer’s location number is the same as or similar to the ECC ship-to / customer number your users expect, the column will show that number even though technically it is “supplying location” in the network, not a dedicated “SHP” column.
+For vendor legs, code sets supply side from locno_to of the arc, which again is still an APO locno, not SD ship-to master data.
+So: the UI does not switch the field to “ship-to”; users infer ship-to when customer location numbering matches business numbering.
+
+3. When can demand quantity ≠ supply quantity in MATBAL?
+By design they are different measures:
+
+Demand is driven from ET_DEMAND aggregation (gt_input_dmd, regional D_*, unfulfilled splits, ratios vs gt_subtot_reg_loc).
+Supply is driven from IT_DEMAND / arcs (gt_supply_dmn_cust_loc, gt_output_dmd, regional S_*, depot lane splits, etc.).
+They diverge when, for example: not all demand is fulfilled in the log; multi-lane depot allocation; captive / conversion flows; vendor supply; or your PROD_QTY fallback that sets total demand from aggregated demand and total supply from lane or delivered qty when regional buckets are empty (so totals can follow different sources than a single customer row).
+
+4. Why only Total Demand / Total Supply and not region-wise columns?
+Dynamic region columns D_<reg_off> and S_<reg_off> are created from lt_reg_off in create_dyn_tab (from planning book + KNVV-derived regions in generate mode, or from ZAPO_MATBAL_ITEM distinct reg_off in display mode). Texts from /bic/pp_reg_off are loaded only when the session name does not contain TEST:
+
+    IF lt_reg_off IS NOT INITIAL AND NOT p_orun CS 'TEST'.
+*      get the retion desctiption
+      SELECT pp~/bic/p_reg_off txtsh
+        FROM /bic/pp_reg_off AS pp
+        INNER JOIN /bic/tp_reg_off AS t
+          ON pp~/bic/p_reg_off = t~/bic/p_reg_off AND langu = sy-langu
+        INTO TABLE gt_reg_off_desc
+        FOR ALL ENTRIES IN lt_reg_off
+        WHERE pp~/bic/p_reg_off = lt_reg_off-table_line AND objvers = 'A'.
+    ENDIF.
+For TEST*, descriptions fall back to the code that appends OTHR and synthetic entries for other region IDs — columns should still exist if lt_reg_off is non-empty.
+
+If users see totals but not regional columns, common causes are:
+
+Saved ZAPO_MATBAL_ITEM has almost no rows — item lines are only written per region when at least one of demand or supply for that region is non-zero:
+      IF lv_demand IS INITIAL AND lv_supply IS INITIAL.
+        CONTINUE.
+      ENDIF.
+So many D_* / S_* cells can be blank in ALV even though header totals (TOT_DMD / TOT_SUPPLY on the header path) are filled from ZAPO_MATBAL_HRD.
+
+ALV layout / column width / optimization — SALV uses set_optimize; a saved layout may hide or push region columns off-screen (your screenshot only shows left key columns).
+
+Rows like PROD_QTY may get totals from the newer aggregation block while regional D_*/S_* stayed initial on the sorted working table — visually “only totals”.
+
+5. Why opening stock looks wrong for Product + SHP
+The report’s persisted key is session, division, scr_plant, supply_plant, matnr, cal_month — there is no ship-to in the table key. Opening stock is read from SNP structures (/sapapo/snpoplpr, snpoplma, snpopmlo) using iv_supply_plant_id (location ID of the supply plant), then scaled in populate_other_qty using aggregated subtotals for that plant/material/month.
+
+So:
+
+Stock is fundamentally at supply (plant/location) level, not per planning ship-to (P_PLANSHP / customer).
+Several ship-tos that share the same supply plant and material end up on one balance line → opening stock is shared and prorated, which is easy to read as “wrong” when judged against a Product + SHP expectation.
+To validate in AD1: compare one problematic line’s scr_plant / supply_plant / matnr / cal_month with how many distinct customers feed that combination in the generation run.
+
+SAP connection note
+I attempted to query AD1 via the configured SAP MCP and received HTTP 401 (no registered RFC client). Once RFC is registered for that system, you can confirm the above quickly with:
+
+SELECT * FROM ZAPO_MATBAL_HRD WHERE SESSIONNAME = '<variant p_orun>'
+SELECT * FROM ZAPO_MATBAL_ITEM WHERE SESSIONNAME = '<same>'
+If you want the Display variant to behave like your P1005781:001:... screenshot for a test name, the functional fix is either save real data under that session name or stop treating that run as TEST* in the code paths that skip fetch_log_data, fetch_pb_data, and BW region text.
+
